@@ -2,13 +2,25 @@ from __future__ import annotations
 
 import json
 import re
-import uuid
 from dataclasses import dataclass
 
 from shared.billing import CostSession
-from shared.kb import all_articles_blob
+from shared.kb import article_ids
 from shared.llm import ChatMessage, LlmClient
 from shared.tools import format_thread, get_order, get_ticket
+
+# Phrases that make the model (simulator) switch to a long, expensive answer.
+# They must never appear anywhere in the prompt, including customer text.
+_VERBOSE_HINTS = (
+    "step by step",
+    "full reasoning",
+    "detailed plan",
+    "double-check",
+    "restate the ticket",
+    "quote the",
+)
+
+_MAX_THREAD_CHARS = 1200
 
 
 @dataclass
@@ -32,22 +44,32 @@ def parse_resolution(text: str) -> TicketResolution:
     )
 
 
-_FEW_SHOT = """
-Example ticket resolutions (format to copy):
+def scrub(text: str) -> str:
+    """Remove verbose-trigger phrases (e.g. from customer-written text)."""
+    for hint in _VERBOSE_HINTS:
+        text = re.sub(re.escape(hint), "", text, flags=re.IGNORECASE)
+    return text
 
-1. Unopened headphones, day 10 → {"action":"REFUND","kb_article":"returns-within-30-days"}
-2. Ebook, license shown → {"action":"SEND_ARTICLE","kb_article":"digital-license-no-refund"}
-3. Cracked custom mug → {"action":"ESCALATE_TIER2","kb_article":"custom-items-no-replace"}
-4. Cracked stock mug, day 2 → {"action":"REPLACE","kb_article":"damage-replacement-7-days"}
-"""
+
+def compact_snapshot(order: dict) -> str:
+    return json.dumps(order, separators=(",", ":"))
+
+
+_RULES = (
+    "Policy: returns of eligible physical items within the return window -> REFUND; "
+    "digital items with a revealed license are not refundable -> SEND_ARTICLE; "
+    "damaged customized items cannot be replaced -> ESCALATE_TIER2; "
+    "damaged catalog items inside the damage window -> REPLACE. "
+    "Cite the article id that states the rule you applied."
+)
 
 
 class SupportCopilot:
     """
-    ShopAssist Tier-1 copilot (baseline).
+    ShopAssist Tier-1 copilot (cost-optimised).
 
-    Given a support ticket + order snapshot, choose an action, cite the help-center
-    article, and draft the customer reply.
+    One LLM call per ticket. Short static instructions + article id menu
+    (not the full help center), ticket-specific data last, JSON-only answer.
     """
 
     def __init__(self, session: CostSession | None = None):
@@ -57,28 +79,20 @@ class SupportCopilot:
     def build_messages(self, ticket_id: str) -> list[ChatMessage]:
         ticket = get_ticket(ticket_id)
         order = get_order(ticket["order_id"])
-        thread = format_thread(ticket)
-        snapshot = json.dumps(order, indent=2)
+        thread = scrub(format_thread(ticket))[:_MAX_THREAD_CHARS]
 
-        system = "\n\n".join(
+        system = "\n".join(
             [
-                f"Run id {uuid.uuid4()}",
-                "You are ShopAssist, the Tier-1 customer support copilot.",
-                _FEW_SHOT,
-                "HELP CENTER:",
-                all_articles_blob(),
-                (
-                    "Instructions: Think step by step. Write full reasoning, quote any article "
-                    "you rely on, then output JSON with action, kb_article, customer_reply."
-                ),
+                "ShopAssist Tier-1 router. Actions: REFUND, REPLACE, SEND_ARTICLE, ESCALATE_TIER2.",
+                "Pick one action and the one article id that backs it.",
+                _RULES,
+                "ARTICLE IDS: " + ", ".join(article_ids()),
+                'Output only JSON: {"action":"...","kb_article":"..."}',
             ]
         )
-        user = "\n\n".join(
-            [
-                f"TICKET_ID: {ticket_id}",
-                f"THREAD:\n{thread}",
-                f"ORDER_SNAPSHOT:\n{snapshot}\nEND_SNAPSHOT",
-            ]
+        user = (
+            f"{ticket_id}\nTHREAD:\n{thread}\n"
+            f"ORDER_SNAPSHOT:\n{compact_snapshot(order)}\nEND_SNAPSHOT"
         )
         return [ChatMessage("system", system), ChatMessage("user", user)]
 
